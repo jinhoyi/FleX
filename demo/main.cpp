@@ -46,6 +46,13 @@
 #include <iostream>
 #include <map>
 
+// For Sending Frames to the Gabriel Server
+#include <thread>
+#include <chrono>
+#include <zmq.hpp>
+#include "proto/gabriel.pb.h"
+#include "proto/openrtist.pb.h"
+
 #include "shaders.h"
 #include "imgui.h"
 
@@ -110,8 +117,11 @@ SDL_GameController* g_gamecontroller = NULL;
 
 using namespace std;
 
-int g_screenWidth = 1280;
-int g_screenHeight = 720;
+//FLAG:SCREEN_SIZE
+// int g_screenWidth = 1280;
+// int g_screenHeight = 720;
+int g_screenWidth = 480;
+int g_screenHeight = 640;
 int g_msaaSamples = 8;
 
 int g_numSubsteps;
@@ -484,7 +494,7 @@ bool g_diffuseShadow;
 float g_diffuseInscatter;
 float g_diffuseOutscatter;
 
-float g_dt = 1.0f / 60.0f;	// the time delta used for simulation
+float g_dt = 1.0f / 120.0f;	// the time delta used for simulation
 float g_realdt;				// the real world time delta between updates
 
 float g_waitTime;		// the CPU time spent waiting for the GPU
@@ -559,6 +569,111 @@ inline float sqr(float x) { return x*x; }
 #include "helpers.h"
 #include "scenes.h"
 #include "benchmark.h"
+
+//CLOCK!!
+class StopWatch {
+	private:
+		typedef std::chrono::high_resolution_clock clock;
+		std::chrono::time_point<clock> t_s;
+	public:
+		// static double frameTime;
+		double lap;
+		inline StopWatch(): lap(g_dt) { start();}
+		inline void start() { t_s = clock::now(); }
+		inline void stop() { lap = std::chrono::duration_cast<std::chrono::duration<double>>(clock::now() - t_s).count(); }
+		// inline double lap() { return _lap; }
+};
+
+inline void sleep(const double t) {
+	if (t > 0.0f) std::this_thread::sleep_for(std::chrono::microseconds((int)(1E6*t + 0.5)));
+}
+
+StopWatch g_frameClock;
+
+inline void vSync() {
+	g_frameClock.stop();
+	// sleep(g_dt - g_frameClock.lap - 0.0003f);
+	sleep(g_dt - g_frameClock.lap);
+	g_frameClock.start();
+}
+
+std::mutex bitmap_mtx; 
+zmq::context_t context(1);
+std::atomic_bool running(false);
+
+
+void send_image(const int* bitmap, zmq::socket_t& socket) {
+    gabriel::InputFrame frame;
+	zmq::message_t request;
+
+	// Wait for next request from the client
+	socket.recv(request, zmq::recv_flags::none);
+
+	bitmap_mtx.lock();
+    frame.add_payloads((char*) bitmap, g_screenHeight * g_screenWidth * sizeof(int));
+	bitmap_mtx.unlock();
+
+    std::string serialized_frame;
+    frame.SerializeToString(&serialized_frame);
+
+    zmq::message_t message(serialized_frame.size());
+    memcpy(message.data(), serialized_frame.data(), serialized_frame.size());
+    socket.send(message, zmq::send_flags::none);
+}
+
+//FLAG:VIDEO_SOCKET
+TgaImage g_framebuffer;
+
+void video_thread() {
+	
+	zmq::socket_t receiver(context, zmq::socket_type::rep);
+	receiver.bind("tcp://*:5559");
+	// receiver.connect("tcp://localhost:5560"); // when using router
+	g_framebuffer.m_width = g_screenWidth;
+	g_framebuffer.m_height = g_screenHeight;
+	g_framebuffer.m_data = new uint32_t[g_screenWidth*g_screenHeight];
+	int *bitmap = (int*)g_framebuffer.m_data;
+
+	while(running) {
+		send_image(bitmap, receiver);
+	}
+}
+
+void imu_thread() {
+	
+	zmq::socket_t imu_socket(context, zmq::socket_type::req);
+	imu_socket.connect("tcp://localhost:5560");
+	const float si_g = 9.81f;
+
+	float imu_x, imu_y, imu_z;
+	imu_x = 0;
+	imu_y = 0;
+	imu_z = -si_g;
+
+	openrtist::Extras extras;
+	zmq::message_t pulled;
+
+	while(running) {
+		// Send request
+		zmq::message_t request (1);
+        memcpy(request.data(), "0", 1);
+		imu_socket.send(request, zmq::send_flags::none);
+
+		imu_socket.recv(pulled, zmq::recv_flags::none);
+		std::string serialized_extra(static_cast<char*>(pulled.data()), pulled.size());
+
+		extras.ParseFromString(serialized_extra);
+		imu_x = -extras.imu_value().x();
+		imu_y = -extras.imu_value().y();
+		imu_z = -extras.imu_value().z();
+
+		g_params.gravity[0] = imu_x;
+		g_params.gravity[1] = imu_y;
+		g_params.gravity[2] = imu_z;
+		// lbm_g->set_f(imu_x, imu_y, imu_z);
+		// printf("x: %f, y: %f, z: %f\n", imu_x, imu_y, imu_z);
+	}
+}
 
 void Init(int scene, bool centerCamera = true)
 {
@@ -648,6 +763,7 @@ void Init(int scene, bool centerCamera = true)
 	// remove collision shapes
 	delete g_mesh; g_mesh = NULL;
 
+	//FLAG:INITIAL_SCENE_SETTING
 	g_frame = 0;
 	g_pause = false;
 
@@ -657,7 +773,7 @@ void Init(int scene, bool centerCamera = true)
 	g_windStrength = 1.0f;
 
 	g_blur = 1.0f;
-	g_fluidColor = Vec4(0.1f, 0.4f, 0.8f, 1.0f);
+	g_fluidColor = Vec4(0.1f, 0.4f, 0.8f, 1.0f); //FLAG:FLUID_COLOR
 	g_meshColor = Vec3(0.9f, 0.9f, 0.9f);
 	g_drawEllipsoids = false;
 	g_drawPoints = true;
@@ -682,6 +798,7 @@ void Init(int scene, bool centerCamera = true)
 	g_ropeScale = 1.0f;
 	g_drawPlaneBias = 0.0f;
 
+	//FLAG:SIM_GRAVITY
 	// sim params
 	g_params.gravity[0] = 0.0f;
 	g_params.gravity[1] = -9.8f;
@@ -778,6 +895,7 @@ void Init(int scene, bool centerCamera = true)
 	uint32_t numParticles = g_buffers->positions.size();
 	uint32_t maxParticles = numParticles + g_numExtraParticles*g_numExtraMultiplier;
 	
+	//FLAG:SETTING_PARTICLE_DISTANCE
 	if (g_params.solidRestDistance == 0.0f)
 		g_params.solidRestDistance = g_params.radius;
 
@@ -815,7 +933,7 @@ void Init(int scene, bool centerCamera = true)
 	// update collision planes to match flexs
 	Vec3 up = Normalize(Vec3(-g_waveFloorTilt, 1.0f, 0.0f));
 
-	(Vec4&)g_params.planes[0] = Vec4(up.x, up.y, up.z, 0.0f);
+	(Vec4&)g_params.planes[0] = Vec4(up.x, up.y, up.z, 0.0f); //ax +  by + cz + d = 0
 	(Vec4&)g_params.planes[1] = Vec4(0.0f, 0.0f, 1.0f, -g_sceneLower.z);
 	(Vec4&)g_params.planes[2] = Vec4(1.0f, 0.0f, 0.0f, -g_sceneLower.x);
 	(Vec4&)g_params.planes[3] = Vec4(-1.0f, 0.0f, 0.0f, g_sceneUpper.x);
@@ -868,12 +986,14 @@ void Init(int scene, bool centerCamera = true)
 	g_solverDesc.maxNeighborsPerParticle = g_maxNeighborsPerParticle;
 	g_solverDesc.maxContactsPerParticle = g_maxContactsPerParticle;
 
+	//FLAG:CREATE_SOLVER
 	// main create method for the Flex solver
 	g_solver = NvFlexCreateSolver(g_flexLib, &g_solverDesc);
 
 	// give scene a chance to do some post solver initialization
 	g_scenes[g_scene]->PostInitialize();
 
+	//FLAG:INITIAL_CAMERA_POSITION
 	// center camera on particles
 	if (centerCamera)
 	{
@@ -1138,6 +1258,7 @@ void UpdateEmitters()
 	}
 }
 
+//FLAG:UPDATE_CAMERA
 void UpdateCamera()
 {
 	Vec3 forward(-sinf(g_camAngle.x)*cosf(g_camAngle.y), sinf(g_camAngle.y), -cosf(g_camAngle.x)*cosf(g_camAngle.y));
@@ -1228,6 +1349,7 @@ void SyncScene()
 	g_scenes[g_scene]->Sync();
 }
 
+//FLAG:UPDATE_SCENE
 void UpdateScene()
 {
 	// give scene a chance to make changes to particle buffers
@@ -1461,6 +1583,8 @@ void RenderScene()
 				DrawPoints(g_fluidRenderBuffers, numParticles - offset, offset, radius, float(g_screenWidth), aspect, fov, g_lightPos, g_lightTarget, lightTransform, g_shadowMap, g_drawDensity);
 		}
 	}
+
+	//FLAG:END_OF_RENDERING
 
 	GraphicsTimerEnd();
 }
@@ -1940,6 +2064,9 @@ int DoUI()
 	return newScene;
 }
 
+
+
+//FLAG:UPDATE_FRAME
 void UpdateFrame()
 {
 	static double lastTime;
@@ -1948,6 +2075,12 @@ void UpdateFrame()
 	double frameBeginTime = GetSeconds();
 
 	g_realdt = float(frameBeginTime - lastTime);
+	
+	//FLAG:SYNC
+	// Synchronize real-frame to 60fps
+	// vSync();
+
+	// printf("g_realdt = %f\n", g_realdt);
 	lastTime = frameBeginTime;
 
 	// do gamepad input polling
@@ -2041,12 +2174,14 @@ void UpdateFrame()
 	MapBuffers(g_buffers);
 
 	double waitEndTime = GetSeconds();
+		
 
 	// Getting timers causes CPU/GPU sync, so we do it after a map
 	float newSimLatency = NvFlexGetDeviceLatency(g_solver, &g_GpuTimers.computeBegin, &g_GpuTimers.computeEnd, &g_GpuTimers.computeFreq);
 	float newGfxLatency = RendererGetDeviceTimestamps(&g_GpuTimers.renderBegin, &g_GpuTimers.renderEnd, &g_GpuTimers.renderFreq);
 	(void)newGfxLatency;
 
+	//FLAG:UPDATE_CAMERA
 	UpdateCamera();
 
 	if (!g_pause || g_step)
@@ -2054,6 +2189,7 @@ void UpdateFrame()
 		UpdateEmitters();
 		UpdateMouse();
 		UpdateWind();
+		//FLAG:UPDATE_SCENE
 		UpdateScene();
 	}
 
@@ -2079,7 +2215,7 @@ void UpdateFrame()
 
 	// main scene render
 	RenderScene();
-	RenderDebug();
+	// RenderDebug();
 
 	int newScene = DoUI();
 
@@ -2101,6 +2237,11 @@ void UpdateFrame()
 		g_mousePos = origin + dir*g_mouseT;
 	}
 
+	// Copy Frame Buffer
+	bitmap_mtx.lock();
+	ReadFrame((int*)g_framebuffer.m_data, g_screenWidth, g_screenHeight);
+	bitmap_mtx.unlock();
+
 	if (g_capture)
 	{
 		TgaImage img;
@@ -2108,6 +2249,7 @@ void UpdateFrame()
 		img.m_height = g_screenHeight;
 		img.m_data = new uint32_t[g_screenWidth*g_screenHeight];
 
+		//FLAG:READ_FRAME
 		ReadFrame((int*)img.m_data, g_screenWidth, g_screenHeight);
 
 		fwrite(img.m_data, sizeof(uint32_t)*g_screenWidth*g_screenHeight, 1, g_ffmpeg);
@@ -2160,7 +2302,7 @@ void UpdateFrame()
 		// tick solver
 		NvFlexSetParams(g_solver, &g_params);
 		NvFlexUpdateSolver(g_solver, g_dt, g_numSubsteps, g_profile);
-
+		
 		g_frame++;
 		g_step = false;
 	}
@@ -2685,6 +2827,9 @@ void SDLInit(const char* title)
 	if (g_graphics == 0)
 	{
 		SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+		// For Sharing Context
+		SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
+
 		flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL;
 	}
 #endif
@@ -2695,6 +2840,8 @@ void SDLInit(const char* title)
 	g_windowId = SDL_GetWindowID(g_window);
 }
 
+
+//FLAG:MAIN_GUI_LOOP:SDLMainLoop()
 void SDLMainLoop()
 {
 #if ENABLE_AFTERMATH_SUPPORT
@@ -2703,10 +2850,12 @@ void SDLMainLoop()
 	{
 		bool quit = false;
 		SDL_Event e;
+
 		while (!quit)
 		{
+			//FLAG:UPDATE_FRAME
 			UpdateFrame();
-
+					
 			while (SDL_PollEvent(&e))
 			{
 				switch (e.type)
@@ -2763,6 +2912,8 @@ void SDLMainLoop()
 				}
 			}
 		}
+
+
 	}
 #if ENABLE_AFTERMATH_SUPPORT
 	__except (true)
@@ -2814,8 +2965,12 @@ int main(int argc, char* argv[])
 		if (sscanf(argv[i], "-msaa=%d", &d))
 			g_msaaSamples = d;
 
-		int w = 1280;
-		int h = 720;
+		// FLAG:SCREEN_SIZE
+		// int w = 1280;
+		// int h = 720;
+		int w = 640;
+		int h = 480;
+
 		if (sscanf(argv[i], "-fullscreen=%dx%d", &w, &h) == 2)
 		{
 			g_screenWidth = w;
@@ -2871,6 +3026,8 @@ int main(int argc, char* argv[])
 				g_graphics = d;
 		}
 	}
+
+	// FLAG:SCENE_SETUP
 
 	// opening scene
 	g_scenes.push_back(new PotPourri("Pot Pourri"));
@@ -3013,95 +3170,97 @@ int main(int argc, char* argv[])
 		plasticStackScene->AddInstance(stackSphere);
 	}
 
-	g_scenes.push_back(softOctopusSceneNew);
-	g_scenes.push_back(softTeapotSceneNew);
-	g_scenes.push_back(softRopeSceneNew);
-	g_scenes.push_back(softClothSceneNew);
-	g_scenes.push_back(softBowlSceneNew);
-	g_scenes.push_back(softRodSceneNew);
-	g_scenes.push_back(softArmadilloSceneNew);
-	g_scenes.push_back(softBunnySceneNew);
+	// g_scenes.push_back(softOctopusSceneNew);
+	// g_scenes.push_back(softTeapotSceneNew);
+	// g_scenes.push_back(softRopeSceneNew);
+	// g_scenes.push_back(softClothSceneNew);
+	// g_scenes.push_back(softBowlSceneNew);
+	// g_scenes.push_back(softRodSceneNew);
+	// g_scenes.push_back(softArmadilloSceneNew);
+	// g_scenes.push_back(softBunnySceneNew);
 
-	g_scenes.push_back(plasticBunniesSceneNew);
-	g_scenes.push_back(plasticComparisonScene);
-	g_scenes.push_back(plasticStackScene);
+	// g_scenes.push_back(plasticBunniesSceneNew);
+	// g_scenes.push_back(plasticComparisonScene);
+	// g_scenes.push_back(plasticStackScene);
 
 	// collision scenes
-	g_scenes.push_back(new FrictionRamp("Friction Ramp"));
-	g_scenes.push_back(new FrictionMovingShape("Friction Moving Box", 0));
-	g_scenes.push_back(new FrictionMovingShape("Friction Moving Sphere", 1));
-	g_scenes.push_back(new FrictionMovingShape("Friction Moving Capsule", 2));
-	g_scenes.push_back(new FrictionMovingShape("Friction Moving Mesh", 3));
-	g_scenes.push_back(new ShapeCollision("Shape Collision"));
-	g_scenes.push_back(new ShapeChannels("Shape Channels"));
-	g_scenes.push_back(new TriangleCollision("Triangle Collision"));
-	g_scenes.push_back(new LocalSpaceFluid("Local Space Fluid"));
-	g_scenes.push_back(new LocalSpaceCloth("Local Space Cloth"));
-	g_scenes.push_back(new CCDFluid("World Space Fluid"));
+	// g_scenes.push_back(new FrictionRamp("Friction Ramp"));
+	// g_scenes.push_back(new FrictionMovingShape("Friction Moving Box", 0));
+	// g_scenes.push_back(new FrictionMovingShape("Friction Moving Sphere", 1));
+	// g_scenes.push_back(new FrictionMovingShape("Friction Moving Capsule", 2));
+	// g_scenes.push_back(new FrictionMovingShape("Friction Moving Mesh", 3));
+	// g_scenes.push_back(new ShapeCollision("Shape Collision"));
+	// g_scenes.push_back(new ShapeChannels("Shape Channels"));
+	// g_scenes.push_back(new TriangleCollision("Triangle Collision"));
+	// g_scenes.push_back(new LocalSpaceFluid("Local Space Fluid"));
+	// g_scenes.push_back(new LocalSpaceCloth("Local Space Cloth"));
+	// g_scenes.push_back(new CCDFluid("World Space Fluid"));
 
 	// cloth scenes
-	g_scenes.push_back(new EnvironmentalCloth("Env Cloth Small", 6, 6, 40, 16));
-	g_scenes.push_back(new EnvironmentalCloth("Env Cloth Large", 16, 32, 10, 3));
-	g_scenes.push_back(new FlagCloth("Flag Cloth"));
-	g_scenes.push_back(new Inflatable("Inflatables"));
-	g_scenes.push_back(new ClothLayers("Cloth Layers"));
-	g_scenes.push_back(new SphereCloth("Sphere Cloth"));
-	g_scenes.push_back(new Tearing("Tearing"));
-	g_scenes.push_back(new Pasta("Pasta"));
+	// g_scenes.push_back(new EnvironmentalCloth("Env Cloth Small", 6, 6, 40, 16));
+	// g_scenes.push_back(new EnvironmentalCloth("Env Cloth Large", 16, 32, 10, 3));
+	// g_scenes.push_back(new FlagCloth("Flag Cloth"));
+	// g_scenes.push_back(new Inflatable("Inflatables"));
+	// g_scenes.push_back(new ClothLayers("Cloth Layers"));
+	// g_scenes.push_back(new SphereCloth("Sphere Cloth"));
+	// g_scenes.push_back(new Tearing("Tearing"));
+	// g_scenes.push_back(new Pasta("Pasta"));
 
 	// game mesh scenes
-	g_scenes.push_back(new GameMesh("Game Mesh Rigid", 0));
-	g_scenes.push_back(new GameMesh("Game Mesh Particles", 1));
-	g_scenes.push_back(new GameMesh("Game Mesh Fluid", 2));
-	g_scenes.push_back(new GameMesh("Game Mesh Cloth", 3));
-	g_scenes.push_back(new RigidDebris("Rigid Debris"));
+	// g_scenes.push_back(new GameMesh("Game Mesh Rigid", 0));
+	// g_scenes.push_back(new GameMesh("Game Mesh Particles", 1));
+	// g_scenes.push_back(new GameMesh("Game Mesh Fluid", 2));
+	// g_scenes.push_back(new GameMesh("Game Mesh Cloth", 3));
+	// g_scenes.push_back(new RigidDebris("Rigid Debris"));
 
 	// viscous fluids
 	g_scenes.push_back(new Viscosity("Viscosity Low", 0.5f));
 	g_scenes.push_back(new Viscosity("Viscosity Med", 3.0f));
 	g_scenes.push_back(new Viscosity("Viscosity High", 5.0f, 0.12f));
-	g_scenes.push_back(new Adhesion("Adhesion"));
-	g_scenes.push_back(new GooGun("Goo Gun", true));
+	// g_scenes.push_back(new Adhesion("Adhesion"));
+	// g_scenes.push_back(new GooGun("Goo Gun", true));
 
 	// regular fluids
 	g_scenes.push_back(new Buoyancy("Buoyancy"));
-	g_scenes.push_back(new Melting("Melting"));
+	// g_scenes.push_back(new Melting("Melting"));
 	g_scenes.push_back(new SurfaceTension("Surface Tension Low", 0.0f));
 	g_scenes.push_back(new SurfaceTension("Surface Tension Med", 10.0f));
 	g_scenes.push_back(new SurfaceTension("Surface Tension High", 20.0f));
 	g_scenes.push_back(new DamBreak("DamBreak  5cm", 0.05f));
-	g_scenes.push_back(new DamBreak("DamBreak 10cm", 0.1f));
-	g_scenes.push_back(new DamBreak("DamBreak 15cm", 0.15f));
+	// g_scenes.push_back(new DamBreak("DamBreak 10cm", 0.1f));
+	// g_scenes.push_back(new DamBreak("DamBreak 15cm", 0.15f));
 	g_scenes.push_back(new RockPool("Rock Pool"));
-	g_scenes.push_back(new RayleighTaylor2D("Rayleigh Taylor 2D"));
+	// g_scenes.push_back(new RayleighTaylor2D("Rayleigh Taylor 2D"));
 
 	// misc feature scenes
-	g_scenes.push_back(new TriggerVolume("Trigger Volume"));
-	g_scenes.push_back(new ForceField("Force Field"));
-	g_scenes.push_back(new InitialOverlap("Initial Overlap"));
+	// g_scenes.push_back(new TriggerVolume("Trigger Volume"));
+	// g_scenes.push_back(new ForceField("Force Field"));
+	// g_scenes.push_back(new InitialOverlap("Initial Overlap"));
 
 	// rigid body scenes
-	g_scenes.push_back(new RigidPile("Rigid2", 2));
-	g_scenes.push_back(new RigidPile("Rigid4", 4));
-	g_scenes.push_back(new RigidPile("Rigid8", 12));
-	g_scenes.push_back(new BananaPile("Bananas"));
-	g_scenes.push_back(new LowDimensionalShapes("Low Dimensional Shapes"));
+	// g_scenes.push_back(new RigidPile("Rigid2", 2));
+	// g_scenes.push_back(new RigidPile("Rigid4", 4));
+	// g_scenes.push_back(new RigidPile("Rigid8", 12));
+	// g_scenes.push_back(new BananaPile("Bananas"));
+	// g_scenes.push_back(new LowDimensionalShapes("Low Dimensional Shapes"));
 
 	// granular scenes
-	g_scenes.push_back(new GranularPile("Granular Pile"));
+	// g_scenes.push_back(new GranularPile("Granular Pile"));
 
 	// coupling scenes
-	g_scenes.push_back(new ParachutingBunnies("Parachuting Bunnies"));
-	g_scenes.push_back(new WaterBalloon("Water Balloons"));
-	g_scenes.push_back(new RigidFluidCoupling("Rigid Fluid Coupling"));
+	// g_scenes.push_back(new ParachutingBunnies("Parachuting Bunnies"));
+	// g_scenes.push_back(new WaterBalloon("Water Balloons"));
+	// g_scenes.push_back(new RigidFluidCoupling("Rigid Fluid Coupling"));
 	g_scenes.push_back(new FluidBlock("Fluid Block"));
-	g_scenes.push_back(new FluidClothCoupling("Fluid Cloth Coupling Water", false));
-	g_scenes.push_back(new FluidClothCoupling("Fluid Cloth Coupling Goo", true));
-	g_scenes.push_back(new BunnyBath("Bunny Bath Dam", true));
+	// g_scenes.push_back(new FluidClothCoupling("Fluid Cloth Coupling Water", false));
+	// g_scenes.push_back(new FluidClothCoupling("Fluid Cloth Coupling Goo", true));
+	// g_scenes.push_back(new BunnyBath("Bunny Bath Dam", true));
 
+	// FLAG:RENGERING_OPTION
 	// init graphics
 	RenderInitOptions options;
 
+	//FLAG:CREATE_CONTEXT
 #ifndef ANDROID
 	DemoContext* demoContext = nullptr;
 #if FLEX_DX
@@ -3262,13 +3421,27 @@ int main(int argc, char* argv[])
 	// create shadow maps
 	g_shadowMap = ShadowCreate();
 
+
+	//FLAG:MAIN_CALLING_INIT
 	// init default scene
 	StartGpuWork();
 	Init(g_scene);
 	EndGpuWork();
 
+	//Start Frame_socket
+
+	running = true;
+
+	thread video_socket(video_thread);
+	thread imu_socket(imu_thread);
+
+	//FLAG:MAIN_CALLING_MAIN_GUI_LOOP
 	SDLMainLoop();
 
+	video_socket.join();
+	imu_socket.join();
+
+	//FLAG:SHUTTING_DOWN
 	if (g_fluidRenderer)
 		DestroyFluidRenderer(g_fluidRenderer);
 

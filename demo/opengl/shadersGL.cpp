@@ -477,6 +477,7 @@ Vec3 GetScreenCoord(Vec3& pos) {
 void ReadFrame(int* backbuffer, int width, int height)
 {
 	glVerify(glReadBuffer(GL_BACK));
+	// glReadBuffer(GL_BACK);
 	glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, backbuffer);
 }
 
